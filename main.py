@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 from lipreading_model import (
-    TrainingConfig, ChineseTokenizer, ChineseLiPSDataset,
+    TrainingConfig, ChineseTokenizer, ChineseLiPSDataset, ProcessedLiPSDataset,
     LipreadingModel, ChineseLiPSTrainer, collate_fn,
     build_tokenizer, calculate_cer, evaluate_model
 )
@@ -63,12 +63,22 @@ def train(args):
     
     # Create datasets
     print("Creating datasets...")
-    train_dataset = ChineseLiPSDataset(
-        config.data_root, config.train_dir, config, tokenizer
+    train_dataset = ProcessedLiPSDataset(
+        config.data_root,
+        config.train_dir,
+        "meta_train.csv",
+        config,
+        tokenizer
     )
-    val_dataset = ChineseLiPSDataset(
-        config.data_root, config.val_dir, config, tokenizer
+    val_dataset = ProcessedLiPSDataset(
+        config.data_root,
+        config.val_dir,
+        "meta_valid.csv",
+        config,
+        tokenizer
     )
+
+    print(len(train_dataset))
     
     # Create dataloaders
     train_loader = DataLoader(

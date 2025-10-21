@@ -3,9 +3,9 @@
 
 # Dataset paths
 data_root: ./Chinese-LiPS
-train_dir: train
-val_dir: val
-test_dir: test
+train_dir: processed_train
+val_dir: processed_val
+test_dir: processed_test
 
 # Model architecture
 hidden_dim: 256  # Balanced for 12GB VRAM

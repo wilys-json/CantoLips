@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import yaml
 from tqdm import tqdm
 import logging
+import pandas as pd
 
 # ========================================================================================
 # CONFIGURATION
@@ -24,9 +25,9 @@ class TrainingConfig:
     
     # Dataset paths
     data_root: str = "./Chinese-LiPS"
-    train_dir: str = "train"
-    val_dir: str = "val"
-    test_dir: str = "test"
+    train_dir: str = "processed_train"
+    val_dir: str = "processed_val"
+    test_dir: str = "processed_test"
     
     # Model architecture
     hidden_dim: int = 256  # Reduced for 12GB VRAM
@@ -302,6 +303,135 @@ class ChineseLiPSDataset(Dataset):
         text_tokens = self.tokenizer.encode(text)
         
         # Truncate if necessary
+        if len(text_tokens) > self.config.max_text_length:
+            text_tokens = text_tokens[:self.config.max_text_length-1] + [self.tokenizer.char2idx['<eos>']]
+        
+        text_tensor = torch.tensor(text_tokens, dtype=torch.long)
+        text_length = len(text_tokens)
+        
+        return video, text_tensor, video_length, text_length
+
+class ProcessedLiPSDataset(Dataset):
+    """Dataset for the flat 'processed' Chinese-LiPS data."""
+    
+    def __init__(self, data_root: str, data_dir: str, meta_csv_path: str, config: TrainingConfig, 
+                 tokenizer: ChineseTokenizer, transform=None):
+        """
+        Args:
+            data_dir: Directory with the flat .mp4 and .wav files (e.g., './processed_train')
+            meta_csv_path: Path to the metadata CSV (e.g., './meta_train.csv')
+            config: Training configuration
+            tokenizer: Chinese tokenizer
+            transform: Optional video transforms
+        """
+        self.data_root = Path(data_root)
+        self.data_dir = Path(data_dir)
+        self.config = config
+        self.tokenizer = tokenizer
+        self.transform = transform
+        
+        # Load metadata
+        try:
+            self.meta_df = pd.read_csv(str(self.data_root / meta_csv_path))
+            logging.info(f"Loaded metadata from {meta_csv_path}")
+        except Exception as e:
+            raise ValueError(f"Could not load metadata CSV: {e}")
+
+        # Find all video files
+        self.video_files = sorted((self.data_root/self.data_dir).glob("*.mp4"))
+        if not self.video_files:
+            raise ValueError(f"No .mp4 files found in {data_dir}")
+        
+        logging.info(f"Found {len(self.video_files)} video samples in {data_dir}")
+
+    def _load_video(self, video_path: str) -> torch.Tensor:
+        """Load and preprocess video frames (same as original class)"""
+        cap = cv2.VideoCapture(video_path)
+        
+        frames = []
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        frame_interval = max(1, int(fps / self.config.fps))
+        
+        frame_idx = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            if frame_idx % frame_interval == 0:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                frame = cv2.resize(frame, (self.config.frame_width, self.config.frame_height))
+                frame = frame.astype(np.float32) / 255.0
+                frames.append(frame)
+            
+            frame_idx += 1
+            if len(frames) >= self.config.max_frames:
+                break
+        
+        cap.release()
+        
+        if len(frames) == 0:
+            logging.warning(f"No frames loaded from {video_path}")
+            frames = [np.zeros((self.config.frame_height, self.config.frame_width), dtype=np.float32)]
+        
+        frames = np.stack(frames, axis=0)
+        T = frames.shape[0]
+        if T < self.config.max_frames:
+            pad_size = self.config.max_frames - T
+            frames = np.concatenate([frames, np.zeros((pad_size, *frames.shape[1:]))], axis=0)
+        else:
+            frames = frames[:self.config.max_frames]
+        
+        frames = torch.from_numpy(frames).float().unsqueeze(0)
+        return frames, min(T, self.config.max_frames)
+
+    def _load_annotation(self, video_path: str) -> str:
+        """Load text annotation from the metadata CSV using the filename."""
+        # Get the base filename without extension
+        base_name = Path(video_path).stem
+        
+        # Find the row in the DataFrame matching this filename
+        # **IMPORTANT**: Adjust 'filename_column' and 'text_column' to match your CSV!
+        try:
+            # Try common column names
+            filename_col = None
+            text_col = None
+            for col in self.meta_df.columns:
+                if 'file' in col.lower() or 'id' in col.lower() or 'path' in col.lower():
+                    filename_col = col
+                if 'text' in col.lower() or 'transcript' in col.lower() or 'content' in col.lower():
+                    text_col = col
+            
+            if filename_col is None or text_col is None:
+                raise ValueError("Could not find filename or text columns in CSV.")
+
+            row = self.meta_df[self.meta_df[filename_col] == base_name]
+            if row.empty:
+                logging.warning(f"No annotation found for {base_name}")
+                return ""
+            
+            text = row[text_col].iloc[0]
+            return str(text)
+        except Exception as e:
+            logging.error(f"Error loading annotation for {base_name}: {e}")
+            return ""
+
+    def __len__(self) -> int:
+        return len(self.video_files)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        video_path = self.video_files[idx]
+        
+        # Load video
+        video, video_length = self._load_video(str(video_path))
+        
+        # Load text
+        text = self._load_annotation(str(video_path))
+        
+        # Encode text
+        text_tokens = self.tokenizer.encode(text)
         if len(text_tokens) > self.config.max_text_length:
             text_tokens = text_tokens[:self.config.max_text_length-1] + [self.tokenizer.char2idx['<eos>']]
         
@@ -846,6 +976,39 @@ class ChineseLiPSTrainer:
         text = self.tokenizer.decode(predicted_ids, skip_special_tokens=True)
         
         return text
+    
+    @torch.no_grad()
+    def validate(self, val_loader: DataLoader) -> float:
+        """Validate model"""
+        self.model.eval()
+        total_loss = 0
+        num_batches = 0
+        
+        for videos, texts, video_lengths, text_lengths in tqdm(val_loader, desc="Validation"):
+            videos = videos.to(self.device)
+            texts = texts.to(self.device)
+            video_lengths = video_lengths.to(self.device)
+            
+            if self.config.mixed_precision:
+                with torch.cuda.amp.autocast():
+                    outputs = self.model(videos, texts, video_lengths, teacher_forcing_ratio=1.0)
+                    
+                    outputs = outputs.reshape(-1, outputs.size(-1))
+                    targets = texts[:, 1:].reshape(-1)
+                    
+                    loss = self.criterion(outputs, targets)
+            else:
+                outputs = self.model(videos, texts, video_lengths, teacher_forcing_ratio=1.0)
+                
+                outputs = outputs.reshape(-1, outputs.size(-1))
+                targets = texts[:, 1:].reshape(-1)
+                
+                loss = self.criterion(outputs, targets)
+            
+            total_loss += loss.item()
+            num_batches += 1
+        
+        return total_loss / num_batches
 
 
 # ========================================================================================
@@ -926,7 +1089,7 @@ def main():
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
         collate_fn=collate_fn,
         pin_memory=True
     )
