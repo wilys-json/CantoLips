@@ -1,0 +1,53 @@
+# config_rtx5070_12gb.yaml
+# Optimized configuration for RTX 5070 12GB VRAM
+
+# Dataset paths
+data_root: ./Chinese-LiPS
+train_dir: train
+val_dir: val
+test_dir: test
+
+# Model architecture
+hidden_dim: 256  # Balanced for 12GB VRAM
+temporal_model: lstm  # LSTM is more memory efficient than Transformer
+num_lstm_layers: 2
+num_transformer_layers: 4
+num_heads: 8
+dropout: 0.3
+
+# Video processing
+max_frames: 75  # ~3 seconds at 25 fps
+frame_height: 96
+frame_width: 96
+fps: 25
+
+# Training hyperparameters
+batch_size: 4  # Conservative for 12GB VRAM
+num_workers: 4  # Adjust based on your CPU cores
+learning_rate: 0.0001
+weight_decay: 0.00001
+num_epochs: 100
+gradient_clip: 5.0
+mixed_precision: true  # Enable AMP for memory efficiency
+
+# Optimization
+warmup_epochs: 5
+scheduler_type: cosine
+step_size: 10
+gamma: 0.5
+
+# Checkpointing
+checkpoint_dir: ./checkpoints
+save_every: 5
+keep_last_n: 3
+
+# Logging
+log_dir: ./logs
+log_every: 50
+
+# Chinese character tokenization
+use_char_level: true
+max_text_length: 200
+
+# Device
+device: cuda:0

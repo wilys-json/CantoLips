@@ -1,0 +1,14 @@
+# Computer Vision
+opencv-python>=4.7.0
+
+# Data Processing
+numpy>=1.21.0
+PyYAML>=6.0
+
+# Utilities
+tqdm>=4.64.0
+
+# Optional but Recommended
+matplotlib>=3.5.0
+tensorboard>=2.10.0
+scikit-learn>=1.1.0

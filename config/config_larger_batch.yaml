@@ -1,0 +1,44 @@
+# config_larger_batch.yaml
+# Configuration with larger batch size (if you have more VRAM headroom)
+
+data_root: ./Chinese-LiPS
+train_dir: train
+val_dir: val
+test_dir: test
+
+hidden_dim: 256
+temporal_model: lstm
+num_lstm_layers: 2
+num_transformer_layers: 4
+num_heads: 8
+dropout: 0.3
+
+max_frames: 75
+frame_height: 96
+frame_width: 96
+fps: 25
+
+batch_size: 8  # Try larger batch if memory allows
+num_workers: 4
+learning_rate: 0.0002  # Increase LR for larger batch
+weight_decay: 0.00001
+num_epochs: 100
+gradient_clip: 5.0
+mixed_precision: true
+
+warmup_epochs: 5
+scheduler_type: cosine
+step_size: 10
+gamma: 0.5
+
+checkpoint_dir: ./checkpoints
+save_every: 5
+keep_last_n: 3
+
+log_dir: ./logs
+log_every: 50
+
+use_char_level: true
+max_text_length: 200
+
+device: cuda:0
