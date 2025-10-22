@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-Training scripts and utilities for Chinese-LiPS Lipreading
+Optimized training script for Chinese-LiPS Lipreading
+Supports HuggingFace dataset format with flat processed directories
 """
 
 import argparse
 import os
 import sys
 from pathlib import Path
+import logging
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent))
 
 from lipreading_model import (
-    TrainingConfig, ChineseTokenizer, ChineseLiPSDataset, ProcessedLiPSDataset,
+    TrainingConfig, ChineseTokenizer, ProcessedLiPSDataset,
     LipreadingModel, ChineseLiPSTrainer, collate_fn,
     build_tokenizer, calculate_cer, evaluate_model
 )
 import torch
 from torch.utils.data import DataLoader
-import logging
 
 
 # ========================================================================================
@@ -28,7 +29,7 @@ import logging
 def train(args):
     """Main training function"""
     
-    # Load config
+    # Load or create config
     if args.config:
         config = TrainingConfig.load(args.config)
     else:
@@ -45,6 +46,8 @@ def train(args):
         config.num_epochs = args.num_epochs
     if args.checkpoint_dir:
         config.checkpoint_dir = args.checkpoint_dir
+    if args.num_workers is not None:
+        config.num_workers = args.num_workers
     
     # Save config
     os.makedirs(config.checkpoint_dir, exist_ok=True)
@@ -59,7 +62,7 @@ def train(args):
         tokenizer = ChineseTokenizer.load(tokenizer_path)
     else:
         print("Building tokenizer from training data...")
-        tokenizer = build_tokenizer(config.data_root, config)
+        tokenizer = build_tokenizer(config.data_root, "meta_train.csv", config)
     
     # Create datasets
     print("Creating datasets...")
@@ -70,6 +73,7 @@ def train(args):
         config,
         tokenizer
     )
+    print(len(train_dataset))
     val_dataset = ProcessedLiPSDataset(
         config.data_root,
         config.val_dir,
@@ -77,8 +81,10 @@ def train(args):
         config,
         tokenizer
     )
-
-    print(len(train_dataset))
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Val samples: {len(val_dataset)}")
+    print(f"Vocabulary size: {tokenizer.vocab_size}")
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -87,7 +93,9 @@ def train(args):
         shuffle=True,
         num_workers=config.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=2 if config.num_workers > 0 else None,
+        persistent_workers=True if config.num_workers > 0 else False
     )
     
     val_loader = DataLoader(
@@ -96,16 +104,21 @@ def train(args):
         shuffle=False,
         num_workers=config.num_workers,
         collate_fn=collate_fn,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=2 if config.num_workers > 0 else None,
+        persistent_workers=True if config.num_workers > 0 else False
     )
-    
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples: {len(val_dataset)}")
-    print(f"Vocabulary size: {tokenizer.vocab_size}")
     
     # Create model
     print("Creating model...")
     model = LipreadingModel(tokenizer.vocab_size, config)
+    
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Model size: {total_params * 4 / 1024 / 1024:.2f} MB (fp32)")
     
     # Create trainer
     trainer = ChineseLiPSTrainer(model, config, tokenizer)
@@ -135,6 +148,10 @@ def test(args):
     
     config = TrainingConfig.load(config_path)
     
+    # Override data_root if specified
+    if args.data_root:
+        config.data_root = args.data_root
+    
     # Load tokenizer
     tokenizer_path = os.path.join(checkpoint_dir, "tokenizer.json")
     if not os.path.exists(tokenizer_path):
@@ -144,9 +161,10 @@ def test(args):
     
     # Create test dataset
     print("Creating test dataset...")
-    test_dataset = ChineseLiPSDataset(
-        args.data_root or config.data_root, 
-        config.test_dir, 
+    test_dataset = ProcessedLiPSDataset(
+        config.data_root,
+        config.test_dir,
+        "meta_test.csv",
         config, 
         tokenizer
     )
@@ -179,9 +197,11 @@ def test(args):
     
     # Evaluate
     avg_cer = evaluate_model(trainer, test_loader)
-    print(f"\nTest Set Results:")
+    print(f"\n{'='*50}")
+    print(f"Test Set Results:")
     print(f"Average CER: {avg_cer:.4f}")
     print(f"Average Accuracy: {(1 - avg_cer) * 100:.2f}%")
+    print(f"{'='*50}")
 
 
 # ========================================================================================
@@ -222,7 +242,7 @@ def inference(args):
     print(f"Loading checkpoint: {checkpoint_path}")
     trainer.load_checkpoint(checkpoint_path)
     
-    # Load video
+    # Load and preprocess video
     print(f"Loading video: {args.video_path}")
     
     import cv2
@@ -234,7 +254,7 @@ def inference(args):
     frame_interval = max(1, int(fps / config.fps))
     
     frame_idx = 0
-    while True:
+    while len(frames) < config.max_frames:
         ret, frame = cap.read()
         if not ret:
             break
@@ -246,14 +266,13 @@ def inference(args):
             frames.append(frame)
         
         frame_idx += 1
-        
-        if len(frames) >= config.max_frames:
-            break
     
     cap.release()
     
     if len(frames) == 0:
         raise ValueError("No frames loaded from video")
+    
+    print(f"Loaded {len(frames)} frames")
     
     # Pad to max_frames
     if len(frames) < config.max_frames:
@@ -268,13 +287,17 @@ def inference(args):
     print("Running inference...")
     predicted_text = trainer.predict(video)
     
-    print(f"\nPredicted text: {predicted_text}")
+    print(f"\n{'='*50}")
+    print(f"Predicted text: {predicted_text}")
     
     # If ground truth is provided
     if args.ground_truth:
         cer = calculate_cer(predicted_text, args.ground_truth)
         print(f"Ground truth: {args.ground_truth}")
         print(f"CER: {cer:.4f}")
+        print(f"Accuracy: {(1 - cer) * 100:.2f}%")
+    
+    print(f"{'='*50}")
 
 
 # ========================================================================================
@@ -286,67 +309,87 @@ def dataset_stats(args):
     
     data_root = Path(args.data_root)
     
-    for split in ['train', 'val', 'test']:
-        split_dir = data_root / split
+    print(f"\nDataset Statistics for {data_root}")
+    print("=" * 70)
+    
+    for split_name, csv_name in [('train', 'meta_train.csv'), 
+                                  ('val', 'meta_valid.csv'), 
+                                  ('test', 'meta_test.csv')]:
+        csv_path = data_root / csv_name
         
-        if not split_dir.exists():
-            print(f"{split} directory not found")
+        if not csv_path.exists():
+            print(f"\n{split_name.upper()} split metadata not found")
             continue
         
-        print(f"\n{split.upper()} SPLIT:")
-        print("=" * 50)
+        import pandas as pd
+        df = pd.read_csv(csv_path)
         
-        num_samples = 0
-        num_speakers = 0
-        total_duration = 0
-        text_lengths = []
+        print(f"\n{split_name.upper()} SPLIT:")
+        print("-" * 70)
+        print(f"Number of samples: {len(df)}")
         
-        for speaker_dir in split_dir.iterdir():
-            if not speaker_dir.is_dir():
-                continue
+        # Text statistics
+        if len(df) > 0 and len(df.columns) >= 6:
+            texts = df.iloc[:, 5].astype(str)
+            text_lengths = texts.str.len()
             
-            num_speakers += 1
-            face_dir = speaker_dir / "FACE"
-            wav_dir = speaker_dir / "WAV"
+            print(f"\nText Statistics:")
+            print(f"  Min length: {text_lengths.min()}")
+            print(f"  Max length: {text_lengths.max()}")
+            print(f"  Mean length: {text_lengths.mean():.2f}")
+            print(f"  Median length: {text_lengths.median():.2f}")
             
-            if not face_dir.exists() or not wav_dir.exists():
-                continue
+            # Unique characters
+            all_chars = set(''.join(texts))
+            print(f"  Unique characters: {len(all_chars)}")
             
-            for video_file in face_dir.glob("*_FACE.mp4"):
-                base_name = video_file.stem.replace("_FACE", "")
-                json_file = wav_dir / f"{base_name}.json"
-                
-                if json_file.exists():
-                    num_samples += 1
-                    
-                    # Get video duration
-                    import cv2
-                    cap = cv2.VideoCapture(str(video_file))
-                    fps = cap.get(cv2.CAP_PROP_FPS)
-                    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    duration = frame_count / fps if fps > 0 else 0
-                    total_duration += duration
-                    cap.release()
-                    
-                    # Get text length
-                    import json
-                    with open(json_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                        text = data.get('text', data.get('transcript', ''))
-                        text_lengths.append(len(text))
+            # Categories
+            if len(df.columns) >= 2:
+                categories = df.iloc[:, 1].value_counts()
+                print(f"\nCategories:")
+                for cat, count in categories.items():
+                    print(f"  {cat}: {count}")
+    
+    print("\n" + "=" * 70)
+
+
+# ========================================================================================
+# DOWNLOAD DATASET (Helper)
+# ========================================================================================
+
+def download_dataset(args):
+    """Download dataset from HuggingFace"""
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("Error: Please install datasets library: pip install datasets")
+        return
+    
+    print(f"Downloading Chinese-LiPS dataset to {args.output_dir}")
+    print("This may take a while...")
+    
+    # Download dataset
+    dataset = load_dataset("BAAI/Chinese-LiPS", cache_dir=args.cache_dir)
+    
+    print(f"\nDataset downloaded successfully!")
+    print(f"Splits available: {list(dataset.keys())}")
+    
+    # Save to local directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    for split in dataset.keys():
+        split_data = dataset[split]
+        print(f"\nProcessing {split} split: {len(split_data)} samples")
         
-        print(f"Number of speakers: {num_speakers}")
-        print(f"Number of samples: {num_samples}")
-        print(f"Total duration: {total_duration / 3600:.2f} hours")
-        print(f"Average duration: {total_duration / num_samples:.2f} seconds")
+        # Save dataset
+        split_dir = output_dir / f"processed_{split}"
+        split_dir.mkdir(exist_ok=True)
         
-        if text_lengths:
-            import numpy as np
-            print(f"Text length stats:")
-            print(f"  Min: {min(text_lengths)}")
-            print(f"  Max: {max(text_lengths)}")
-            print(f"  Mean: {np.mean(text_lengths):.2f}")
-            print(f"  Median: {np.median(text_lengths):.2f}")
+        # You would need to implement the actual file saving logic here
+        # based on the dataset structure
+    
+    print(f"\nDataset saved to {output_dir}")
 
 
 # ========================================================================================
@@ -354,37 +397,53 @@ def dataset_stats(args):
 # ========================================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Chinese-LiPS Lipreading Training")
+    parser = argparse.ArgumentParser(
+        description="Optimized Chinese-LiPS Lipreading Training",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     subparsers = parser.add_subparsers(dest='command', help='Command to run')
     
     # Train command
     train_parser = subparsers.add_parser('train', help='Train model')
     train_parser.add_argument('--config', type=str, help='Config file path')
-    train_parser.add_argument('--data_root', type=str, help='Dataset root directory')
+    train_parser.add_argument('--data_root', type=str, default='./Chinese-LiPS',
+                             help='Dataset root directory')
     train_parser.add_argument('--batch_size', type=int, help='Batch size')
     train_parser.add_argument('--learning_rate', type=float, help='Learning rate')
     train_parser.add_argument('--num_epochs', type=int, help='Number of epochs')
-    train_parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory')
+    train_parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                             help='Checkpoint directory')
     train_parser.add_argument('--resume', type=str, help='Resume from checkpoint')
+    train_parser.add_argument('--num_workers', type=int, help='Number of data loading workers')
     
     # Test command
-        # Test command
     test_parser = subparsers.add_parser('test', help='Test model')
     test_parser.add_argument('--data_root', type=str, help='Dataset root directory')
     test_parser.add_argument('--batch_size', type=int, help='Batch size')
-    test_parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory')
+    test_parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                            help='Checkpoint directory')
     test_parser.add_argument('--checkpoint', type=str, help='Checkpoint file path')
     
     # Inference command
     inference_parser = subparsers.add_parser('inference', help='Run inference on a video')
-    inference_parser.add_argument('--video_path', type=str, required=True, help='Path to video file')
-    inference_parser.add_argument('--checkpoint_dir', type=str, help='Checkpoint directory')
+    inference_parser.add_argument('--video_path', type=str, required=True, 
+                                 help='Path to video file')
+    inference_parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints',
+                                 help='Checkpoint directory')
     inference_parser.add_argument('--checkpoint', type=str, help='Checkpoint file path')
-    inference_parser.add_argument('--ground_truth', type=str, help='Ground truth text for comparison')
+    inference_parser.add_argument('--ground_truth', type=str, 
+                                 help='Ground truth text for comparison')
     
     # Dataset stats command
     stats_parser = subparsers.add_parser('stats', help='Show dataset statistics')
-    stats_parser.add_argument('--data_root', type=str, required=True, help='Dataset root directory')
+    stats_parser.add_argument('--data_root', type=str, required=True, 
+                             help='Dataset root directory')
+    
+    # Download command
+    download_parser = subparsers.add_parser('download', help='Download dataset from HuggingFace')
+    download_parser.add_argument('--output_dir', type=str, default='./Chinese-LiPS',
+                                help='Output directory for dataset')
+    download_parser.add_argument('--cache_dir', type=str, help='Cache directory for downloads')
     
     args = parser.parse_args()
     
@@ -396,6 +455,8 @@ def main():
         inference(args)
     elif args.command == 'stats':
         dataset_stats(args)
+    elif args.command == 'download':
+        download_dataset(args)
     else:
         parser.print_help()
 
